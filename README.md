@@ -44,6 +44,10 @@ Dans **Paramètres**, utilisez **Importer l’ancienne configuration** pour tran
 
 La même page permet d’ajouter, modifier, supprimer ou tester un switch sans redémarrer FastAPI. Les champs de mot de passe ne sont jamais relus ni exposés par l’API. Le modèle est libre pour prendre en charge de futurs équipements TP-Link ; le pilote générique `model="Switch"` reste explicitement appliqué au TL-SG105PE et aux modèles Easy Smart actuels.
 
+## Diagnostic de lecture TP-Link
+
+Les lectures convertissent explicitement les dataclasses `tplink-tool` (`SystemInfo`, `PortInfo`, `Dot1QVlanEntry`) vers des objets JSON. Toute réponse de forme inattendue est rejetée avec son type exact, et FastAPI écrit le traceback complet sous le logger `lfinfo.switches`; l’erreur n’est pas remplacée par des données vides. Les TL-SG105PE utilisent `model="Switch"` pour conserver la compatibilité connue, les modèles `*DE` utilisent `SwitchDE`, et les autres modèles sont laissés à l’auto-détection de `make_switch`.
+
 ## Mise à jour
 
 ```bash

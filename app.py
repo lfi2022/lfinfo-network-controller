@@ -1,8 +1,9 @@
-import os, json, secrets, asyncio, sqlite3
+import os, json, secrets, asyncio, sqlite3, logging
 from pathlib import Path
 from datetime import datetime, timezone
 from contextlib import contextmanager
 from typing import Literal
+from dataclasses import asdict, is_dataclass
 
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
@@ -27,6 +28,7 @@ LEGACY_SWITCHES = [
 app = FastAPI(title='LFINFO Switch Controller', docs_url=None, redoc_url=None)
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
 security = HTTPBasic()
+logger = logging.getLogger('lfinfo.switches')
 
 def now(): return datetime.now(timezone.utc).isoformat()
 
@@ -88,6 +90,10 @@ def find_switch(sid: str):
     return row
 
 def primitive(value):
+    # tplink-tool uses @dataclass for all public read models.  Convert these
+    # before the generic fallback: str(Dot1QVlanEntry) would otherwise turn a
+    # VLAN into text and fail later at vlan.get(...).
+    if is_dataclass(value) and not isinstance(value, type): return primitive(asdict(value))
     if hasattr(value, '_asdict'): return primitive(value._asdict())
     if isinstance(value, dict): return {str(k): primitive(v) for k, v in value.items()}
     if isinstance(value, (tuple, list)): return [primitive(v) for v in value]
@@ -95,21 +101,60 @@ def primitive(value):
     if hasattr(value, 'name') and hasattr(value, 'value'): return str(value.name)
     return str(value)
 
+def model_override(device):
+    """Use the correct protocol family without forcing all devices to Switch."""
+    model = str(device['model']).strip().upper()
+    # TL-SG105PE V2 is known to require the E-series driver despite unreliable
+    # autodetection. The other supported E-series devices may autodetect.
+    if model == 'TL-SG105PE': return 'Switch'
+    if model.endswith('DE'): return 'SwitchDE'
+    if model in {'SWITCH', 'SWITCHDE'}: return model.title().replace('De', 'DE')
+    return None
+
+def require_mapping(value, source):
+    if not isinstance(value, dict):
+        raise TypeError(f'{source} returned {type(value).__name__}, expected a mapping')
+    return value
+
+def normalize_vlan_entries(entries):
+    if not isinstance(entries, (list, tuple)):
+        raise TypeError(f'get_dot1q_vlans() returned entries as {type(entries).__name__}, expected a list')
+    normalized = []
+    for index, entry in enumerate(entries):
+        vlan = require_mapping(primitive(entry), f'get_dot1q_vlans()[{index}]')
+        normalized.append(vlan)
+    return normalized
+
 @contextmanager
 def connected(sid: str):
     device = find_switch(sid)
     if not device['enabled']: raise ValueError('Switch désactivé')
-    # The forced generic driver keeps TL-SG105PE V2 compatible; it also works for current Easy Smart switches.
-    with make_switch(device['ip'], password=decrypt(device['credentials']), model='Switch') as switch: yield switch, device
+    override = model_override(device)
+    kwargs = {'password': decrypt(device['credentials'])}
+    if override: kwargs['model'] = override
+    with make_switch(device['ip'], **kwargs) as switch: yield switch, device
 
 def fetch(sid: str):
-    with connected(sid) as (switch, device):
-        info, ports = primitive(switch.get_system_info()), primitive(switch.get_port_settings())
-        vlans_on, vlans = switch.get_dot1q_vlans(); pvids = primitive(switch.get_pvids()); vlans = [primitive(v) for v in vlans]
-        for vlan in vlans:
-            for key in ('tagged_members', 'untagged_members'):
-                mask = int(vlan.get(key, 0)); vlan[key.replace('_members', '_ports')] = [index + 1 for index in range(device['ports']) if mask & (1 << index)]
-        return {**switch_public(device), 'info': info, 'ports': ports, 'vlans_enabled': vlans_on, 'vlans': vlans, 'pvids': pvids, 'read_at': now()}
+    try:
+        with connected(sid) as (switch, device):
+            info = require_mapping(primitive(switch.get_system_info()), 'get_system_info()')
+            ports = primitive(switch.get_port_settings())
+            if not isinstance(ports, list) or not all(isinstance(port, dict) for port in ports):
+                raise TypeError('get_port_settings() did not return a list of port mappings')
+            dot1q = switch.get_dot1q_vlans()
+            if not isinstance(dot1q, tuple) or len(dot1q) != 2:
+                raise TypeError(f'get_dot1q_vlans() returned {type(dot1q).__name__}, expected (enabled, entries)')
+            vlans_on, raw_vlans = dot1q
+            vlans = normalize_vlan_entries(raw_vlans)
+            pvids = primitive(switch.get_pvids())
+            if not isinstance(pvids, list): raise TypeError(f'get_pvids() returned {type(pvids).__name__}, expected a list')
+            for vlan in vlans:
+                for key in ('tagged_members', 'untagged_members'):
+                    mask = int(vlan.get(key, 0)); vlan[key.replace('_members', '_ports')] = [index + 1 for index in range(device['ports']) if mask & (1 << index)]
+            return {**switch_public(device), 'info': info, 'ports': ports, 'vlans_enabled': bool(vlans_on), 'vlans': vlans, 'pvids': pvids, 'read_at': now()}
+    except Exception:
+        logger.exception('Read failure for switch id=%s', sid)
+        raise
 
 def backup(sid: str, actor: str, reason: str):
     snapshot = fetch(sid)
