@@ -43,7 +43,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, ip TEXT NOT NULL UNIQUE,
             model TEXT NOT NULL, firmware TEXT, ports INTEGER NOT NULL DEFAULT 8,
             credentials BLOB NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
-            last_status TEXT NOT NULL DEFAULT 'unknown', last_tested_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            last_status TEXT NOT NULL DEFAULT 'unknown', last_tested_at TEXT, last_error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT, occurred_at TEXT NOT NULL, actor TEXT NOT NULL,
             action TEXT NOT NULL, switch_id INTEGER, details TEXT NOT NULL);
@@ -51,6 +51,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, actor TEXT NOT NULL,
             switch_id INTEGER NOT NULL, reason TEXT NOT NULL, snapshot TEXT NOT NULL);
         ''')
+        # Lightweight forward migration for controllers created before last_error existed.
+        columns = {row['name'] for row in conn.execute('PRAGMA table_info(switches)')}
+        if 'last_error' not in columns: conn.execute('ALTER TABLE switches ADD COLUMN last_error TEXT')
 
 @app.on_event('startup')
 def startup():
@@ -77,7 +80,7 @@ def audit(actor: str, action: str, switch_id: int | None = None, **details):
     with db() as conn: conn.execute('INSERT INTO audit_log (occurred_at,actor,action,switch_id,details) VALUES (?,?,?,?,?)', (now(), actor, action, switch_id, json.dumps(details)))
 
 def switch_public(row):
-    return {'id': str(row['id']), 'name': row['name'], 'ip': row['ip'], 'model': row['model'], 'firmware': row['firmware'], 'ports': row['ports'], 'enabled': bool(row['enabled']), 'last_status': row['last_status'], 'last_tested_at': row['last_tested_at']}
+    return {'id': str(row['id']), 'name': row['name'], 'ip': row['ip'], 'model': row['model'], 'firmware': row['firmware'], 'ports': row['ports'], 'enabled': bool(row['enabled']), 'last_status': row['last_status'], 'last_tested_at': row['last_tested_at'], 'last_error': row['last_error']}
 
 def find_switch(sid: str):
     with db() as conn: row = conn.execute('SELECT * FROM switches WHERE id=?', (sid,)).fetchone()
@@ -185,12 +188,14 @@ def delete_switch(sid: str, actor: str = Depends(auth)):
 async def test_switch(sid: str, actor: str = Depends(auth)):
     try:
         detail = await asyncio.wait_for(asyncio.to_thread(fetch, sid), timeout=25)
-        with db() as conn: conn.execute("UPDATE switches SET last_status='online',last_tested_at=? WHERE id=?", (now(), sid))
+        with db() as conn: conn.execute("UPDATE switches SET last_status='online',last_tested_at=?,last_error=NULL WHERE id=?", (now(), sid))
         audit(actor, 'switch.test_succeeded', int(sid)); return {'ok': True, 'switch': detail}
     except Exception as error:
-        with db() as conn: conn.execute("UPDATE switches SET last_status='offline',last_tested_at=? WHERE id=?", (now(), sid))
+        # The message is capped before storage and response; credentials are never interpolated here.
+        message = f'{type(error).__name__}: {str(error)[:200]}'
+        with db() as conn: conn.execute("UPDATE switches SET last_status='offline',last_tested_at=?,last_error=? WHERE id=?", (now(), message, sid))
         audit(actor, 'switch.test_failed', int(sid), error=type(error).__name__)
-        raise HTTPException(502, f'{type(error).__name__}: {str(error)[:200]}')
+        raise HTTPException(502, message)
 
 @app.post('/api/switches/import-legacy')
 def import_legacy(actor: str = Depends(auth)):

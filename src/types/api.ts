@@ -1,6 +1,7 @@
 export interface SwitchSummary {
   id: string; name: string; ip: string; ports: number; model?: string; firmware?: string | null
   enabled?: boolean; last_status?: string; last_tested_at?: string | null
+  last_error?: string | null
 }
 
 export interface Port {
