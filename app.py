@@ -162,12 +162,23 @@ def read_switch(switch, port_count):
     return info, ports, vlans_on, vlans, pvids
 
 def discover_switch(switch):
-    """Minimal read-only inventory used before persisting a new device."""
-    info = require_mapping(primitive(switch.get_system_info()), 'get_system_info()')
-    ports = primitive(switch.get_port_settings())
-    if not isinstance(ports, list) or not all(isinstance(port, dict) for port in ports):
-        raise TypeError('get_port_settings() did not return a list of port mappings')
+    """Découverte en lecture seule, tolérante aux ports non pris en charge."""
+    info = require_mapping(
+        primitive(switch.get_system_info()),
+        'get_system_info()'
+    )
+
+    try:
+        ports = primitive(switch.get_port_settings())
+        if not isinstance(ports, list) or not all(
+            isinstance(port, dict) for port in ports
+        ):
+            ports = []
+    except (RuntimeError, ValueError, TypeError):
+        ports = []
+
     return info, ports
+
 
 def backup(sid: str, actor: str, reason: str):
     snapshot = fetch(sid)
@@ -231,7 +242,7 @@ def create_switch(body: NewSwitchInput, actor: str = Depends(auth)):
         # A new/unlisted Easy Smart model first uses factory autodetection, then
         # the known E-series fallback used for TL-SG105PE.
         try:
-            with make_switch(body.ip, password=body.password) as switch:
+            with make_switch(body.ip, password=body.password, model='Switch') as switch:
                 info, ports = discover_switch(switch)
         except ValueError:
             with make_switch(body.ip, password=body.password, model='Switch') as switch:
