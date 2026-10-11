@@ -42,7 +42,7 @@ Copiez cette valeur dans `SWITCH_DB_ENCRYPTION_KEY`. Cette clé chiffre les iden
 
 Dans **Paramètres**, utilisez **Importer l’ancienne configuration** pour transférer les quatre équipements depuis les anciennes variables `SW_108E_PASSWORD`, `SW_108PE_PASSWORD`, `SW_105PE_PASSWORD` et `SW_105E_PASSWORD`. L’import évite les doublons. Une fois vérifié, retirez ces quatre variables du `.env`.
 
-La même page permet d’ajouter, modifier, supprimer ou tester un switch sans redémarrer FastAPI. Les champs de mot de passe ne sont jamais relus ni exposés par l’API. Le modèle est libre pour prendre en charge de futurs équipements TP-Link ; le pilote générique `model="Switch"` reste explicitement appliqué au TL-SG105PE et aux modèles Easy Smart actuels.
+La même page permet d’ajouter, modifier, supprimer ou tester un switch sans redémarrer FastAPI. Lors de l’ajout, seuls l’adresse IP et le mot de passe sont demandés : le contrôleur lit ensuite automatiquement le nom, modèle, firmware et nombre de ports avant de créer l’équipement. Les champs de mot de passe ne sont jamais relus ni exposés par l’API. Le modèle détecté est conservé pour prendre en charge de futurs équipements TP-Link ; le pilote générique `model="Switch"` reste explicitement appliqué au TL-SG105PE.
 
 ## Diagnostic de lecture TP-Link
 

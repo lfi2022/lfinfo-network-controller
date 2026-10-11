@@ -106,7 +106,7 @@ def model_override(device):
     model = str(device['model']).strip().upper()
     # TL-SG105PE V2 is known to require the E-series driver despite unreliable
     # autodetection. The other supported E-series devices may autodetect.
-    if model == 'TL-SG105PE': return 'Switch'
+    if model.startswith('TL-SG105PE'): return 'Switch'
     if model.endswith('DE'): return 'SwitchDE'
     if model in {'SWITCH', 'SWITCHDE'}: return model.title().replace('De', 'DE')
     return None
@@ -137,24 +137,37 @@ def connected(sid: str):
 def fetch(sid: str):
     try:
         with connected(sid) as (switch, device):
-            info = require_mapping(primitive(switch.get_system_info()), 'get_system_info()')
-            ports = primitive(switch.get_port_settings())
-            if not isinstance(ports, list) or not all(isinstance(port, dict) for port in ports):
-                raise TypeError('get_port_settings() did not return a list of port mappings')
-            dot1q = switch.get_dot1q_vlans()
-            if not isinstance(dot1q, tuple) or len(dot1q) != 2:
-                raise TypeError(f'get_dot1q_vlans() returned {type(dot1q).__name__}, expected (enabled, entries)')
-            vlans_on, raw_vlans = dot1q
-            vlans = normalize_vlan_entries(raw_vlans)
-            pvids = primitive(switch.get_pvids())
-            if not isinstance(pvids, list): raise TypeError(f'get_pvids() returned {type(pvids).__name__}, expected a list')
-            for vlan in vlans:
-                for key in ('tagged_members', 'untagged_members'):
-                    mask = int(vlan.get(key, 0)); vlan[key.replace('_members', '_ports')] = [index + 1 for index in range(device['ports']) if mask & (1 << index)]
+            info, ports, vlans_on, vlans, pvids = read_switch(switch, device['ports'])
             return {**switch_public(device), 'info': info, 'ports': ports, 'vlans_enabled': bool(vlans_on), 'vlans': vlans, 'pvids': pvids, 'read_at': now()}
     except Exception:
         logger.exception('Read failure for switch id=%s', sid)
         raise
+
+def read_switch(switch, port_count):
+    """Read and validate SDK objects. This function never writes to hardware."""
+    info = require_mapping(primitive(switch.get_system_info()), 'get_system_info()')
+    ports = primitive(switch.get_port_settings())
+    if not isinstance(ports, list) or not all(isinstance(port, dict) for port in ports):
+        raise TypeError('get_port_settings() did not return a list of port mappings')
+    dot1q = switch.get_dot1q_vlans()
+    if not isinstance(dot1q, tuple) or len(dot1q) != 2:
+        raise TypeError(f'get_dot1q_vlans() returned {type(dot1q).__name__}, expected (enabled, entries)')
+    vlans_on, raw_vlans = dot1q
+    vlans = normalize_vlan_entries(raw_vlans)
+    pvids = primitive(switch.get_pvids())
+    if not isinstance(pvids, list): raise TypeError(f'get_pvids() returned {type(pvids).__name__}, expected a list')
+    for vlan in vlans:
+        for key in ('tagged_members', 'untagged_members'):
+            mask = int(vlan.get(key, 0)); vlan[key.replace('_members', '_ports')] = [index + 1 for index in range(port_count) if mask & (1 << index)]
+    return info, ports, vlans_on, vlans, pvids
+
+def discover_switch(switch):
+    """Minimal read-only inventory used before persisting a new device."""
+    info = require_mapping(primitive(switch.get_system_info()), 'get_system_info()')
+    ports = primitive(switch.get_port_settings())
+    if not isinstance(ports, list) or not all(isinstance(port, dict) for port in ports):
+        raise TypeError('get_port_settings() did not return a list of port mappings')
+    return info, ports
 
 def backup(sid: str, actor: str, reason: str):
     snapshot = fetch(sid)
@@ -169,6 +182,16 @@ class SwitchInput(BaseModel):
     ports: int = Field(ge=1, le=52)
     password: str = Field(min_length=1, max_length=256)
     enabled: bool = True
+
+    @field_validator('ip')
+    @classmethod
+    def no_space_ip(cls, value):
+        if any(char.isspace() for char in value): raise ValueError('Adresse IP invalide')
+        return value
+
+class NewSwitchInput(BaseModel):
+    ip: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=1, max_length=256)
 
     @field_validator('ip')
     @classmethod
@@ -202,13 +225,28 @@ def switches(_: str = Depends(auth)):
     with db() as conn: return [switch_public(row) for row in conn.execute('SELECT * FROM switches ORDER BY name')]
 
 @app.post('/api/switches', status_code=201)
-def create_switch(body: SwitchInput, actor: str = Depends(auth)):
+def create_switch(body: NewSwitchInput, actor: str = Depends(auth)):
     try:
+        # Detect every display field from the hardware before creating a record.
+        # A new/unlisted Easy Smart model first uses factory autodetection, then
+        # the known E-series fallback used for TL-SG105PE.
+        try:
+            with make_switch(body.ip, password=body.password) as switch:
+                info, ports = discover_switch(switch)
+        except ValueError:
+            with make_switch(body.ip, password=body.password, model='Switch') as switch:
+                info, ports = discover_switch(switch)
+        model = str(info.get('hardware') or info.get('description') or 'TP-Link Easy Smart')
+        name = str(info.get('description') or model)
+        firmware = str(info.get('firmware') or '') or None
         with db() as conn:
-            cursor = conn.execute('INSERT INTO switches (name,ip,model,firmware,ports,credentials,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)', (body.name, body.ip, body.model, body.firmware, body.ports, encrypt(body.password), body.enabled, now(), now()))
+            cursor = conn.execute('INSERT INTO switches (name,ip,model,firmware,ports,credentials,enabled,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)', (name, body.ip, model, firmware, len(ports), encrypt(body.password), True, now(), now()))
             row = conn.execute('SELECT * FROM switches WHERE id=?', (cursor.lastrowid,)).fetchone()
-        audit(actor, 'switch.created', row['id'], ip=body.ip, model=body.model); return switch_public(row)
+        audit(actor, 'switch.created', row['id'], ip=body.ip, model=model, discovered_ports=len(ports)); return switch_public(row)
     except sqlite3.IntegrityError: raise HTTPException(409, 'Cette adresse IP existe déjà')
+    except Exception as error:
+        logger.exception('Discovery failed for new switch ip=%s', body.ip)
+        raise HTTPException(502, f'Découverte impossible: {type(error).__name__}: {str(error)[:200]}')
 
 @app.put('/api/switches/{sid}')
 def update_switch(sid: str, body: SwitchUpdate, actor: str = Depends(auth)):
