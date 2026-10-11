@@ -1,4 +1,4 @@
-import { BarChart3, Boxes, Cable, LayoutDashboard, Moon, RefreshCw, Settings, Sun, Tags } from 'lucide-react'
+import { BarChart3, Boxes, Cable, ChartNoAxesCombined, LayoutDashboard, Moon, RefreshCw, Settings, Sun, Tags } from 'lucide-react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
 import { cn } from '../lib/utils'
@@ -9,6 +9,7 @@ const links = [
   { to: '/devices', label: 'Équipements', icon: Boxes },
   { to: '/ports', label: 'Ports', icon: Cable },
   { to: '/vlans', label: 'VLAN', icon: Tags },
+  { to: '/statistics', label: 'Statistiques', icon: ChartNoAxesCombined },
   { to: '/insights', label: 'Insights', icon: BarChart3 },
 ]
 
@@ -18,6 +19,7 @@ const names: Record<string, [string, string]> = {
   '/ports': ['Ports', 'État et configuration réseau par port.'],
   '/vlans': ['Réseaux virtuels', 'Lecture 802.1Q et matrice des appartenances.'],
   '/insights': ['Insights', 'Indicateurs disponibles via le switch.'],
+  '/statistics': ['Statistiques', 'Analyse historique des paquets réseau.'],
   '/settings': ['Paramètres', 'Configuration et sécurité du contrôleur.'],
 }
 

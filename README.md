@@ -48,6 +48,36 @@ La même page permet d’ajouter, modifier, supprimer ou tester un switch sans r
 
 Les lectures convertissent explicitement les dataclasses `tplink-tool` (`SystemInfo`, `PortInfo`, `Dot1QVlanEntry`) vers des objets JSON. Toute réponse de forme inattendue est rejetée avec son type exact, et FastAPI écrit le traceback complet sous le logger `lfinfo.switches`; l’erreur n’est pas remplacée par des données vides. Les TL-SG105PE utilisent `model="Switch"` pour conserver la compatibilité connue, les modèles `*DE` utilisent `SwitchDE`, et les autres modèles sont laissés à l’auto-détection de `make_switch`.
 
+## Statistiques réseau
+
+Le collecteur serveur interroge périodiquement `get_port_settings()` et `get_port_statistics()` sans dépendre d’un navigateur connecté. Il enregistre les compteurs RX/TX bruts, l’état et la vitesse de chaque port dans SQLite. Les valeurs RX/TX affichées dans **Statistiques** sont des **paquets par seconde** : elles sont calculées entre deux relevés consécutifs. Une baisse de compteur, un redémarrage ou un premier relevé produit volontairement une valeur indisponible.
+
+Réglez la fréquence et la rétention dans `.env` :
+
+```dotenv
+STATS_COLLECTION_INTERVAL_SECONDS=60
+STATS_RETENTION_DAYS=30
+```
+
+La fréquence minimale est de 30 secondes et la rétention minimale d’un jour. Les lectures d’un même switch sont sérialisées pour éviter les sessions concurrentes. Aucun endpoint de statistiques n’applique de configuration réseau.
+
+## Live Traffic et animations
+
+La page **Ports** propose **Activer Live**. Tant qu’au moins un navigateur consulte un switch, le serveur réduit uniquement la cadence de son collecteur de lecture à `LIVE_COLLECTION_INTERVAL_SECONDS` (5 secondes au minimum). Le navigateur relit SQLite toutes les deux secondes, sans ouvrir de session supplémentaire vers le switch. Le mode Live s’arrête automatiquement après cinq minutes ou quand les clients cessent de se manifester (`LIVE_CLIENT_TTL_SECONDS`).
+
+Les particules RX (bleu) et TX (vert) suivent les valeurs réellement calculées en paquets par seconde. Leur densité et leur vitesse utilisent une échelle logarithmique; elles se figent lorsque la mesure est périmée. La vitesse négociée du lien reste affichée séparément. Motion respecte `prefers-reduced-motion`; aucune donnée de démonstration n’est ajoutée.
+
+```dotenv
+LIVE_COLLECTION_INTERVAL_SECONDS=5
+LIVE_CLIENT_TTL_SECONDS=15
+```
+
+Pour exécuter les tests Python sur TLManager :
+
+```bash
+.venv/bin/python -m unittest tests/test_statistics.py
+```
+
 ## Mise à jour
 
 ```bash

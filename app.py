@@ -1,6 +1,6 @@
-import os, json, secrets, asyncio, sqlite3, logging
+import os, json, secrets, asyncio, sqlite3, logging, threading, time
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import contextmanager
 from typing import Literal
 from dataclasses import asdict, is_dataclass
@@ -29,6 +29,18 @@ app = FastAPI(title='LFINFO Switch Controller', docs_url=None, redoc_url=None)
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')
 security = HTTPBasic()
 logger = logging.getLogger('lfinfo.switches')
+COLLECTION_STOP = threading.Event()
+SWITCH_LOCKS: dict[str, threading.Lock] = {}
+SWITCH_LOCKS_GUARD = threading.Lock()
+
+def switch_lock(sid: str):
+    with SWITCH_LOCKS_GUARD:
+        return SWITCH_LOCKS.setdefault(str(sid), threading.Lock())
+
+def collection_interval(): return max(30, int(os.getenv('STATS_COLLECTION_INTERVAL_SECONDS', '60')))
+def retention_days(): return max(1, int(os.getenv('STATS_RETENTION_DAYS', '30')))
+def live_interval(): return max(5, int(os.getenv('LIVE_COLLECTION_INTERVAL_SECONDS', '5')))
+def live_ttl_seconds(): return max(10, int(os.getenv('LIVE_CLIENT_TTL_SECONDS', '15')))
 
 def now(): return datetime.now(timezone.utc).isoformat()
 
@@ -52,6 +64,23 @@ def init_db():
         CREATE TABLE IF NOT EXISTS configuration_backups (
             id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, actor TEXT NOT NULL,
             switch_id INTEGER NOT NULL, reason TEXT NOT NULL, snapshot TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS port_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at TEXT NOT NULL,
+            switch_id INTEGER NOT NULL, port INTEGER NOT NULL, tx_pkts INTEGER,
+            rx_pkts INTEGER, tx_pps REAL, rx_pps REAL, active INTEGER NOT NULL,
+            speed_mbps INTEGER, speed_cfg TEXT);
+        CREATE INDEX IF NOT EXISTS idx_port_samples_time ON port_samples(recorded_at);
+        CREATE INDEX IF NOT EXISTS idx_port_samples_switch_port ON port_samples(switch_id, port, recorded_at);
+        CREATE TABLE IF NOT EXISTS collection_status (
+            switch_id INTEGER PRIMARY KEY, collected_at TEXT, last_error TEXT);
+        CREATE TABLE IF NOT EXISTS switch_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, recorded_at TEXT NOT NULL,
+            switch_id INTEGER NOT NULL, vlan_count INTEGER);
+        CREATE INDEX IF NOT EXISTS idx_switch_samples_time ON switch_samples(recorded_at);
+        CREATE TABLE IF NOT EXISTS live_clients (
+            switch_id INTEGER NOT NULL, client_id TEXT NOT NULL, expires_at TEXT NOT NULL,
+            PRIMARY KEY (switch_id, client_id));
+        CREATE INDEX IF NOT EXISTS idx_live_clients_expiry ON live_clients(expires_at);
         ''')
         # Lightweight forward migration for controllers created before last_error existed.
         columns = {row['name'] for row in conn.execute('PRAGMA table_info(switches)')}
@@ -65,6 +94,12 @@ def startup():
     try: Fernet(key.encode())
     except Exception as error: raise RuntimeError('SWITCH_DB_ENCRYPTION_KEY doit être une clé Fernet valide') from error
     init_db()
+    COLLECTION_STOP.clear()
+    threading.Thread(target=collection_loop, name='lfinfo-port-collector', daemon=True).start()
+
+@app.on_event('shutdown')
+def shutdown():
+    COLLECTION_STOP.set()
 
 def cipher(): return Fernet(os.environ['SWITCH_DB_ENCRYPTION_KEY'].encode())
 def encrypt(password: str): return cipher().encrypt(password.encode()).decode()
@@ -136,9 +171,10 @@ def connected(sid: str):
 
 def fetch(sid: str):
     try:
-        with connected(sid) as (switch, device):
-            info, ports, vlans_on, vlans, pvids = read_switch(switch, device['ports'])
-            return {**switch_public(device), 'info': info, 'ports': ports, 'vlans_enabled': bool(vlans_on), 'vlans': vlans, 'pvids': pvids, 'read_at': now()}
+        with switch_lock(sid):
+            with connected(sid) as (switch, device):
+                info, ports, vlans_on, vlans, pvids = read_switch(switch, device['ports'])
+                return {**switch_public(device), 'info': info, 'ports': ports, 'vlans_enabled': bool(vlans_on), 'vlans': vlans, 'pvids': pvids, 'read_at': now()}
     except Exception:
         logger.exception('Read failure for switch id=%s', sid)
         raise
@@ -178,6 +214,96 @@ def discover_switch(switch):
         ports = []
 
     return info, ports
+
+def speed_mbps(value):
+    """Convert SDK speed labels to Mbps; never infer throughput from packets."""
+    text = str(value or '').upper()
+    if '1000' in text or '1G' in text: return 1000
+    if '100' in text: return 100
+    if '10' in text: return 10
+    return None
+
+def packet_rate(current, previous, recorded_at):
+    """Return packets/s only for monotonic counters with a positive interval."""
+    if not previous or current is None: return None
+    previous_value, previous_at = previous
+    delta_seconds = (datetime.fromisoformat(recorded_at) - datetime.fromisoformat(previous_at)).total_seconds()
+    if previous_value is None or current < previous_value or delta_seconds <= 0:
+        return None  # Counter reset/reboot or an invalid timestamp: never fake a rate.
+    return round((current - previous_value) / delta_seconds, 3)
+
+def collect_switch_statistics(sid: str):
+    """Read one switch once. The caller must hold its per-switch lock."""
+    with connected(sid) as (switch, device):
+        settings = primitive(switch.get_port_settings())
+        stats = primitive(switch.get_port_statistics())
+        if not isinstance(settings, list) or not all(isinstance(item, dict) for item in settings):
+            raise TypeError('get_port_settings() did not return a list of mappings')
+        if not isinstance(stats, list) or not all(isinstance(item, dict) for item in stats):
+            raise TypeError('get_port_statistics() did not return a list of mappings')
+        settings_by_port = {int(item['port']): item for item in settings if item.get('port') is not None}
+        recorded_at = now()
+        vlan_count = None
+        try:
+            dot1q = switch.get_dot1q_vlans()
+            if isinstance(dot1q, tuple) and len(dot1q) == 2 and isinstance(dot1q[1], (list, tuple)):
+                vlan_count = len(dot1q[1])
+        except Exception:
+            logger.info('VLAN count unavailable during statistics collection for switch id=%s', sid, exc_info=True)
+        with db() as conn:
+            for item in stats:
+                port = int(item['port']); tx = item.get('tx_pkts'); rx = item.get('rx_pkts')
+                if not isinstance(tx, int) or not isinstance(rx, int):
+                    raise TypeError(f'get_port_statistics() port {port} returned non-integer counters')
+                old = conn.execute('SELECT tx_pkts,rx_pkts,recorded_at FROM port_samples WHERE switch_id=? AND port=? ORDER BY id DESC LIMIT 1', (sid, port)).fetchone()
+                previous_tx = (old['tx_pkts'], old['recorded_at']) if old else None
+                previous_rx = (old['rx_pkts'], old['recorded_at']) if old else None
+                setting = settings_by_port.get(port, {})
+                conn.execute('INSERT INTO port_samples (recorded_at,switch_id,port,tx_pkts,rx_pkts,tx_pps,rx_pps,active,speed_mbps,speed_cfg) VALUES (?,?,?,?,?,?,?,?,?,?)', (
+                    recorded_at, sid, port, tx, rx, packet_rate(tx, previous_tx, recorded_at), packet_rate(rx, previous_rx, recorded_at),
+                    bool(setting.get('speed_act')), speed_mbps(setting.get('speed_act')), str(setting.get('speed_cfg') or ''),
+                ))
+            conn.execute('INSERT INTO switch_samples (recorded_at,switch_id,vlan_count) VALUES (?,?,?)', (recorded_at, sid, vlan_count))
+            conn.execute('INSERT INTO collection_status(switch_id,collected_at,last_error) VALUES(?,?,NULL) ON CONFLICT(switch_id) DO UPDATE SET collected_at=excluded.collected_at,last_error=NULL', (sid, recorded_at))
+            conn.execute("DELETE FROM port_samples WHERE recorded_at < ?", ((datetime.now(timezone.utc) - timedelta(days=retention_days())).isoformat(),))
+            conn.execute("DELETE FROM switch_samples WHERE recorded_at < ?", ((datetime.now(timezone.utc) - timedelta(days=retention_days())).isoformat(),))
+        return len(stats)
+
+def live_switch_ids():
+    current = now()
+    with db() as conn:
+        conn.execute('DELETE FROM live_clients WHERE expires_at<?', (current,))
+        return {row['switch_id'] for row in conn.execute('SELECT DISTINCT switch_id FROM live_clients WHERE expires_at>=?', (current,))}
+
+def collection_due(sid, interval):
+    with db() as conn: row = conn.execute('SELECT MAX(recorded_at) AS last_at FROM port_samples WHERE switch_id=?', (sid,)).fetchone()
+    if not row or not row['last_at']: return True
+    return (datetime.now(timezone.utc) - datetime.fromisoformat(row['last_at'])).total_seconds() >= interval
+
+def collect_all_statistics():
+    active_live = live_switch_ids()
+    with db() as conn: devices = [row['id'] for row in conn.execute('SELECT id FROM switches WHERE enabled=1')]
+    for sid in devices:
+        interval = live_interval() if sid in active_live else collection_interval()
+        if not collection_due(sid, interval): continue
+        lock = switch_lock(sid)
+        if not lock.acquire(blocking=False):
+            logger.info('Statistics skipped for switch id=%s: another read is active', sid)
+            continue
+        try:
+            collect_switch_statistics(str(sid))
+        except Exception as error:
+            logger.exception('Statistics collection failed for switch id=%s', sid)
+            with db() as conn: conn.execute('INSERT INTO collection_status(switch_id,collected_at,last_error) VALUES(?,?,?) ON CONFLICT(switch_id) DO UPDATE SET collected_at=excluded.collected_at,last_error=excluded.last_error', (sid, now(), f'{type(error).__name__}: {str(error)[:200]}'))
+        finally: lock.release()
+
+def collection_loop():
+    while not COLLECTION_STOP.is_set():
+        try: collect_all_statistics()
+        except Exception: logger.exception('Statistics collector cycle failed')
+        # A short scheduler tick enables Live Traffic without giving clients
+        # direct access to switch hardware. Per-switch due checks cap polling.
+        COLLECTION_STOP.wait(1)
 
 
 def backup(sid: str, actor: str, reason: str):
@@ -311,6 +437,38 @@ def audit_entries(_: str = Depends(auth)):
 @app.get('/api/backups')
 def backups(_: str = Depends(auth)):
     with db() as conn: return [dict(row) for row in conn.execute('SELECT id,created_at,actor,switch_id,reason FROM configuration_backups ORDER BY id DESC LIMIT 100')]
+
+@app.get('/api/statistics')
+def statistics(period: Literal['15m', '1h', '6h', '24h'] = '1h', switch_id: str | None = None, _: str = Depends(auth)):
+    windows = {'15m': timedelta(minutes=15), '1h': timedelta(hours=1), '6h': timedelta(hours=6), '24h': timedelta(hours=24)}
+    start = (datetime.now(timezone.utc) - windows[period]).isoformat()
+    query, params = 'SELECT recorded_at,switch_id,port,tx_pps,rx_pps,active,speed_mbps,speed_cfg FROM port_samples WHERE recorded_at>=?', [start]
+    vlan_query, vlan_params = 'SELECT recorded_at,switch_id,vlan_count FROM switch_samples WHERE recorded_at>=?', [start]
+    status_query, status_params = 'SELECT switch_id,collected_at,last_error FROM collection_status', []
+    if switch_id:
+        query += ' AND switch_id=?'; params.append(switch_id)
+        vlan_query += ' AND switch_id=?'; vlan_params.append(switch_id)
+        status_query += ' WHERE switch_id=?'; status_params.append(switch_id)
+    query += ' ORDER BY recorded_at ASC'; vlan_query += ' ORDER BY recorded_at ASC'
+    with db() as conn:
+        samples = [dict(row) for row in conn.execute(query, params)]
+        vlan_samples = [dict(row) for row in conn.execute(vlan_query, vlan_params)]
+        collection = [dict(row) for row in conn.execute(status_query, status_params)]
+    return {'period': period, 'start': start, 'samples': samples, 'vlan_samples': vlan_samples, 'collection': collection, 'retention_days': retention_days(), 'interval_seconds': collection_interval()}
+
+@app.get('/api/live/switches/{sid}')
+def live_traffic(sid: str, client_id: str, _: str = Depends(auth)):
+    """Register an in-memory-browser viewer; this endpoint only reads SQLite."""
+    if not client_id or len(client_id) > 100: raise HTTPException(422, 'Identifiant Live invalide')
+    try: find_switch(sid)
+    except ValueError as error: raise HTTPException(404, str(error))
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=live_ttl_seconds())).isoformat()
+    with db() as conn:
+        conn.execute('INSERT INTO live_clients(switch_id,client_id,expires_at) VALUES(?,?,?) ON CONFLICT(switch_id,client_id) DO UPDATE SET expires_at=excluded.expires_at', (sid, client_id, expires_at))
+        samples = [dict(row) for row in conn.execute('SELECT recorded_at,port,tx_pps,rx_pps,active,speed_mbps,speed_cfg FROM port_samples WHERE switch_id=? ORDER BY id DESC LIMIT 80', (sid,))]
+        status = conn.execute('SELECT collected_at,last_error FROM collection_status WHERE switch_id=?', (sid,)).fetchone()
+    samples.reverse()
+    return {'switch_id': sid, 'samples': samples, 'collection_interval_seconds': live_interval(), 'client_expires_at': expires_at, 'collected_at': status['collected_at'] if status else None, 'last_error': status['last_error'] if status else None}
 
 @app.get('/api/switches/{sid}')
 async def details(sid: str, _: str = Depends(auth)):

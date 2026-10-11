@@ -1,4 +1,4 @@
-import type { AuditEntry, ControllerStatus, NewSwitchInput, SwitchDetail, SwitchInput, SwitchSummary } from '../types/api'
+import type { AuditEntry, ControllerStatus, LiveTrafficResponse, NewSwitchInput, StatisticsPeriod, StatisticsResponse, SwitchDetail, SwitchInput, SwitchSummary } from '../types/api'
 
 export class ApiError extends Error {
   constructor(message: string, public status?: number) { super(message) }
@@ -25,6 +25,8 @@ export const api = {
   testSwitch: (id: string) => request<{ ok: boolean; switch: SwitchDetail }>(`/switches/${id}/test`, { method: 'POST' }),
   importLegacy: () => request<{ added: string[]; skipped: { ip: string; reason: string }[] }>('/switches/import-legacy', { method: 'POST' }),
   audit: () => request<AuditEntry[]>('/audit'),
+  statistics: (period: StatisticsPeriod, switchId?: string) => request<StatisticsResponse>(`/statistics?period=${period}${switchId ? `&switch_id=${encodeURIComponent(switchId)}` : ''}`),
+  liveTraffic: (id: string, clientId: string) => request<LiveTrafficResponse>(`/live/switches/${id}?client_id=${encodeURIComponent(clientId)}`),
   setPortEnabled: (id: string, port: number, enabled: boolean) => request<SwitchDetail>(`/switches/${id}/ports/${port}/enabled`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled, confirm: true }),
   }),
