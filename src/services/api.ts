@@ -1,4 +1,4 @@
-import type { ControllerStatus, SwitchDetail, SwitchSummary } from '../types/api'
+import type { AuditEntry, ControllerStatus, SwitchDetail, SwitchInput, SwitchSummary } from '../types/api'
 
 export class ApiError extends Error {
   constructor(message: string, public status?: number) { super(message) }
@@ -19,6 +19,12 @@ export const api = {
   controllerStatus: () => request<ControllerStatus>('/controller/status'),
   switches: () => request<SwitchSummary[]>('/switches'),
   switchDetail: (id: string) => request<SwitchDetail>(`/switches/${id}`),
+  createSwitch: (input: SwitchInput) => request<SwitchSummary>('/switches', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }),
+  updateSwitch: (id: string, input: Omit<SwitchInput, 'password'> & { password?: string }) => request<SwitchSummary>(`/switches/${id}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }),
+  deleteSwitch: (id: string) => request<void>(`/switches/${id}`, { method: 'DELETE' }),
+  testSwitch: (id: string) => request<{ ok: boolean; switch: SwitchDetail }>(`/switches/${id}/test`, { method: 'POST' }),
+  importLegacy: () => request<{ added: string[]; skipped: { ip: string; reason: string }[] }>('/switches/import-legacy', { method: 'POST' }),
+  audit: () => request<AuditEntry[]>('/audit'),
   setPortEnabled: (id: string, port: number, enabled: boolean) => request<SwitchDetail>(`/switches/${id}/ports/${port}/enabled`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled, confirm: true }),
   }),

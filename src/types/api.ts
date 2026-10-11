@@ -1,4 +1,7 @@
-export interface SwitchSummary { id: string; name: string; ip: string; ports: number }
+export interface SwitchSummary {
+  id: string; name: string; ip: string; ports: number; model?: string; firmware?: string | null
+  enabled?: boolean; last_status?: string; last_tested_at?: string | null
+}
 
 export interface Port {
   port: number | string
@@ -31,3 +34,5 @@ export interface SwitchDetail {
 }
 
 export interface ControllerStatus { writes_enabled: boolean }
+export interface SwitchInput { name: string; ip: string; model: string; firmware?: string; ports: number; password: string; enabled: boolean }
+export interface AuditEntry { id: number; occurred_at: string; actor: string; action: string; switch_id: number | null; details: string }
